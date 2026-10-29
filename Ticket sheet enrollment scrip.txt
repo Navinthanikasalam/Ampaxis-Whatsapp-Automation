@@ -1,0 +1,214 @@
+// Full Drive scope required
+const SCOPES = [
+  'https://www.googleapis.com/auth/spreadsheets',
+  'https://www.googleapis.com/auth/drive'
+];
+
+// const SHEET_NAME = "Responses";
+const SHEET_NAME = "Responses";
+const PARENT_FOLDER_ID = "1xl_maWV8Y4AGrV916uLSJp2pJ3gGGP3D";
+
+// SECURITY LIMITS
+// ============================================================
+const MAX_FILE_SIZE_MB  = 15;
+const MAX_TOTAL_FILES   = 20;  // raised to support multiple uploads across all steps
+const MAX_BASE64_LENGTH = MAX_FILE_SIZE_MB * 1024 * 1024 * 1.37; // Base64 ~33% larger
+const RATE_LIMIT_SECONDS = 10;
+
+// ============================================================
+// MIRROR CONFIG
+// ============================================================
+ const SOURCE_SHEET_ID      = "12V-m9KbYuQtje0zsPJICAkAVpfPn1vyTPSllvvwpaaI";
+ const SOURCE_SHEET_NAME    = "Responses";
+// To enable mirroring set `MIRROR_SHEET_ID` to the destination spreadsheet ID
+// and `MIRROR_SHEET_NAME` to the destination sheet name. Leave empty to disable.
+const MIRROR_SHEET_ID = "1WgrADcT08No5MnLra1reZ9qhICVzHpBswAk-Hv5k4o0"; // e.g. "1ktJL_sLh3GX6WVURlu9Eeoc_lmCOfl7_FDep0ytmsnc"
+const MIRROR_SHEET_NAME = "ticket raising"; // e.g. "job recuritment"
+
+// ============================================================
+// HELPERS
+// ============================================================
+ 
+function sanitizeText(str) {
+  if (!str) return "";
+  return String(str).replace(/[<>]/g, "").trim();
+}
+ 
+function checkRateLimit(key) {
+  const cache = CacheService.getScriptCache();
+  const last  = cache.get(key);
+  if (last) throw new Error("Too many requests. Please wait a few seconds.");
+  cache.put(key, "1", RATE_LIMIT_SECONDS);
+}
+ 
+// Mirror helper: appends the given row array to the configured mirror spreadsheet/sheet.
+function mirrorRowToSpreadsheet(rowArray) {
+  try {
+    if (!MIRROR_SHEET_ID) return; // mirroring disabled
+
+    const destSs = SpreadsheetApp.openById(MIRROR_SHEET_ID);
+    var destSheet = null;
+    if (MIRROR_SHEET_NAME) {
+      destSheet = destSs.getSheetByName(MIRROR_SHEET_NAME);
+    }
+    if (!destSheet) {
+      // fallback to first sheet if name not found or not provided
+      destSheet = destSs.getSheets()[0];
+      if (!destSheet) {
+        destSheet = destSs.insertSheet();
+      }
+    }
+
+    destSheet.appendRow(rowArray);
+  } catch (mirrorErr) {
+    Logger.log("Mirroring error: " + mirrorErr.message);
+  }
+}
+
+// ============================================================
+// ROUTES
+// ============================================================
+ 
+function doGet(e) {
+  return HtmlService.createHtmlOutput("OK");
+}
+ 
+function doPost(e) {
+  try {
+    const data = JSON.parse(e.postData.contents);
+ 
+    // =========================================================
+    // CASE 1 — FILE UPLOAD
+    // =========================================================
+    if (data.action === "uploadFiles") {
+ 
+      if (!data.userName) {
+        throw new Error("Invalid request: missing user name");
+      }
+ 
+      const userKey = "upload_" + (e.parameter?.ip || "unknown");
+      checkRateLimit(userKey);
+ 
+      const userName         = sanitizeText(data.userName);
+      const files            = data.files || [];
+      const existingFolderId = data.folderId || null;
+ 
+      if (files.length > MAX_TOTAL_FILES) {
+        throw new Error("Too many files uploaded at once");
+      }
+ 
+      const parentFolder = DriveApp.getFolderById(PARENT_FOLDER_ID);
+ 
+      // Reuse existing subfolder OR create a new one (only on first upload)
+      let submissionFolder;
+      if (existingFolderId) {
+        submissionFolder = DriveApp.getFolderById(existingFolderId);
+      } else {
+        const timestamp  = Utilities.formatDate(
+          new Date(),
+          Session.getScriptTimeZone(),
+          "yyyy-MM-dd_HH-mm-ss"
+        );
+        const uniqueId   = Utilities.getUuid().slice(0, 8);
+        const folderName = userName + "_" + timestamp + "_" + uniqueId;
+        submissionFolder = parentFolder.createFolder(folderName);
+      }
+ 
+      const uploadedLinks = [];
+ 
+      files.forEach(function (fileObj) {
+        try {
+          if (!fileObj.data || !fileObj.name) return;
+ 
+          if (fileObj.data.length > MAX_BASE64_LENGTH) {
+            throw new Error("File too large: " + fileObj.name);
+          }
+ 
+          const safeName = sanitizeText(fileObj.name);
+          const fileBlob = Utilities.newBlob(
+            Utilities.base64Decode(fileObj.data),
+            fileObj.mimeType || "application/octet-stream",
+            safeName
+          );
+ 
+          const created = submissionFolder.createFile(fileBlob);
+          created.setSharing(
+            DriveApp.Access.ANYONE_WITH_LINK,
+            DriveApp.Permission.VIEW
+          );
+ 
+          uploadedLinks.push(created.getUrl());
+ 
+        } catch (fileErr) {
+          // skip bad file, continue with the rest
+          Logger.log("File upload error: " + fileErr.message);
+        }
+      });
+ 
+      return ContentService
+        .createTextOutput(JSON.stringify({
+          success:  true,
+          links:    uploadedLinks,
+          folderId: submissionFolder.getId()
+        }))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+ 
+    // =========================================================
+    // CASE 2 — FORM SUBMISSION (writes to Google Sheets)
+    // =========================================================
+    // CASE 2 — FAULT REPORT FORM SUBMISSION
+if (data.formType === "faultReport" || data.registerMobileNumber) {
+
+  if (!data.registerMobileNumber) {
+    throw new Error("Invalid form submission: missing mobile number");
+  }
+
+  const submitKey = "submit_" + sanitizeText(data.registerMobileNumber);
+  checkRateLimit(submitKey);
+
+  const sheet = SpreadsheetApp
+    .getActiveSpreadsheet()
+    .getSheetByName(SHEET_NAME);
+
+  const proofLinks = (data.proofFiles || []).join("\n");
+
+  sheet.appendRow([
+    new Date(),                                        // Timestamp
+    sanitizeText(data.registerMobileNumber),           // Register Mobile Number
+    proofLinks,                                        // Upload Fault Evidence
+    sanitizeText(data.faultCategory || ""),            // Fault Category
+    sanitizeText(data.serviceDescription || ""),       // Service Description
+  ]);
+
+  // --- Mirror the appended row to the configured mirror spreadsheet (if enabled)
+  try {
+    var mirrorRow = [
+      new Date(),
+      sanitizeText(data.registerMobileNumber),
+      proofLinks,
+      sanitizeText(data.faultCategory || ""),
+      sanitizeText(data.serviceDescription || "")
+    ];
+    mirrorRowToSpreadsheet(mirrorRow);
+  } catch (mi) {
+    Logger.log('Mirror call failed: ' + mi.message);
+  }
+
+  return ContentService
+    .createTextOutput(JSON.stringify({ success: true }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+ 
+    throw new Error("Invalid request: unrecognized payload");
+ 
+  } catch (err) {
+    Logger.log("doPost error: " + err.message);
+    return ContentService
+      .createTextOutput(JSON.stringify({
+        success: false,
+        error:   err.message
+      }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+}

@@ -1,0 +1,1340 @@
+/*
+ * Ampaxis AMC WhatsApp Queue Automation
+ * Sheet 2 - Complete Script - FINAL v9
+ * (Electrical Maintenance for Homes & Businesses)
+ *
+ * ===============================================================
+ * SETUP CHECKLIST — READ THIS FIRST IF PASTING INTO A NEW PROJECT
+ * ===============================================================
+ * Apps Script runs in Google's cloud, so which computer you copy/paste
+ * from does not matter. What DOES matter is the Google account and
+ * spreadsheets this script has access to. Before going live in a new
+ * environment (e.g. the client's own Google account):
+ *
+ *   1. This script must be bound to the correct spreadsheet — open it
+ *      via Extensions → Apps Script from inside the actual
+ *      "ticket raising" spreadsheet, not a standalone script project.
+ *      (installAllTriggers() relies on getActiveSpreadsheet().)
+ *
+ *   2. The account that owns/runs this script needs at least Editor
+ *      access to the spreadsheet at QUEUE_SPREADSHEET_ID and at least
+ *      Viewer access to CUSTOMER_DETAIL_SPREADSHEET_ID. If those IDs
+ *      point to spreadsheets owned by a different Google account than
+ *      the one deploying this script, either share those spreadsheets
+ *      with this script's account, or replace the IDs below with the
+ *      client's own copies.
+ *
+ *   3. CUSTOMER_DETAIL_WEB_APP_URL must point to a deployed web app
+ *      that is reachable ("Anyone" or "Anyone with Google account"
+ *      access). If it's tied to someone else's Apps Script project,
+ *      confirm it will stay deployed — otherwise re-deploy your own
+ *      copy and update this URL.
+ *
+ *   4. After pasting the code in, run runSetupCheck() once (Run menu →
+ *      select runSetupCheck → Run) and read the Execution Log. It
+ *      checks every external dependency above and tells you exactly
+ *      what's missing instead of you finding out from a silent failure.
+ *
+ *   5. Run installAllTriggers() once to (re)install onEdit,
+ *      onFormSubmit, the mirrored-row scanner, and the
+ *      resetStaleQueuedMessages safety-net trigger. Triggers do NOT carry over automatically when code is
+ *      copy-pasted into a new project.
+ *
+ *   6. Deploy → New deployment → Web app, execute as "Me", access
+ *      "Anyone", to get a URL for this script's own doGet/doPost
+ *      endpoint (the one your WhatsApp sender script polls).
+ *
+ *   7. The first execution will prompt for OAuth authorization
+ *      (Spreadsheet access, external URL fetch). This must be approved
+ *      by the Google account that owns the script.
+ * ===============================================================
+ *
+ * TRIGGER RULES:
+ *   Status = "Not Assigned"  → message to CUSTOMER (issue type + description only, no tech/schedule data)
+ *   Status = "Assigned"      → message to CUSTOMER + Technician ID + Technician Phone
+ *   Tech Status (any)      → message to TECHNICIAN phone + full Customer Details
+ *   Final Status (any)       → single combined message to CUSTOMER = Final Status + Feedback Form
+ *   Feedback Form (alone)    → NO message, NO queue — ignored completely
+ *
+ * TICKET ID FORMAT: AMP-YYYYMMDD-001 (auto-incremented, unique)
+ *
+ * v8 CHANGES (fix for duplicate WhatsApp sends):
+ *   - doGet() now calls getAndDispatchPendingMessages(), which grabs only
+ *     truly PENDING rows, immediately flips them to QUEUED, and does this
+ *     inside a LockService lock. This closes the race window where two
+ *     overlapping polls (e.g. your sender script running again before the
+ *     previous run's markSent() call lands) would both fetch the same
+ *     PENDING row and send it twice.
+ *   - Added resetStaleQueuedMessages() — a safety net you can run on a
+ *     time-driven trigger (e.g. every 10 minutes) to revert any message
+ *     stuck in QUEUED for too long (e.g. because the sender script crashed
+ *     mid-run and never called markSent/markFailed) back to PENDING so it
+ *     isn't lost forever.
+ *   - Queue sheet now also stamps a "QueuedAt" time in the existing SentAt
+ *     column the moment a message is dispatched to the sender; markSent()
+ *     overwrites it with the real sent time as before.
+ */
+
+// ============================================================
+// CONFIG
+// ============================================================
+
+const DATA_SHEET_NAMES           = ['ticket raising', 'Ticket Raising page'];
+const QUEUE_SHEET_NAME           = 'Message Queue';
+const QUEUE_SPREADSHEET_ID       = '1WgrADcT08No5MnLra1reZ9qhICVzHpBswAk-Hv5k4o0';
+const HEADER_ROW                 = 1;
+const PHONE_HEADER               = 'Register Mobile Number';
+const TICKET_ID_HEADER           = 'Ticket Id';
+const PRIORITY_HEADER            = 'Priority';
+const MAIN_FAULT_HEADER          = 'Main Fault Catagorie';
+const ASSIGN_HOURS_HEADER        = 'Assign Hours';
+const ASSIGN_TECHNICIAN_HEADER   = 'Assign Technician';
+const DATE_TIME_HEADER           = 'Date and Time';
+const TICKET_ID_PREFIX           = 'AMP';
+
+const CUSTOMER_DETAIL_SPREADSHEET_ID = '1MLNmN1wyMlfF1yzxNFwQYZFw3QKsFVm3PMgsEDf1PA8';
+const CUSTOMER_DETAIL_WEB_APP_URL    = 'https://script.google.com/macros/s/AKfycbx4oq_ETMOvnffdsGklgKmAtiFSey5miMgUrcgcWGzX0kvIb7lrudO4wtC-O9eu4nIV_Q/exec';
+
+const CUSTOMER_DETAIL_FIELDS = [
+  'AMC Type', 'BHK Connection', 'Premises Details', 'Building Square Feet',
+  'Floor Number', 'Ownership', 'Contact Person Name', 'Contact Person Number',
+  'Address', 'Area', 'City', 'State', 'Location'
+];
+
+// Status values that trigger the "Assigned" message (with technician details)
+// Add any future assigned-type values here — everything else is treated as "Not Assigned"
+const ASSIGNED_STATUS_VALUES = ['assigned', 'technician assigned', 'tech assigned'];
+
+const STATUS_TRIGGER_HEADER        = 'Status';
+const DETAIL_STATUS_TRIGGER_HEADER  = 'Tech Status';
+const FINAL_STATUS_TRIGGER_HEADER  = 'Final Status';
+const FEEDBACK_FORM_HEADER         = 'Feedback Form';  // read-only for Final Status message; never triggers independently
+const NON_TRIGGER_EDIT_HEADERS      = [
+  PHONE_HEADER, PRIORITY_HEADER, 'Main Fault Catagorie', 'Main Fault Category',
+  ASSIGN_HOURS_HEADER, ASSIGN_TECHNICIAN_HEADER, DATE_TIME_HEADER,
+  'Date & Time', 'Date/Time', 'Date Time',
+  'Upload Fault Evidence', 'Fault Category', 'Service Description'
+];
+
+const WA_STATUS_PENDING = 'PENDING';
+const WA_STATUS_QUEUED  = 'QUEUED';
+const WA_STATUS_SENT    = 'SENT';
+const WA_STATUS_FAILED  = 'FAILED';
+
+// How long (in minutes) a message is allowed to sit in QUEUED before we
+// assume the sender script died mid-run and revert it back to PENDING.
+const STALE_QUEUE_MINUTES = 10;
+
+// ============================================================
+// onEdit — MAIN TRIGGER
+// ============================================================
+
+function onEdit(e) {
+  try {
+    if (!e || !e.range) return;
+
+    var range  = e.range;
+    var sheet  = range.getSheet();
+    var shName = sheet.getName();
+
+    if (!DATA_SHEET_NAMES.includes(shName)) return;
+    if (range.getRow() <= HEADER_ROW) return;
+
+    var headers = getHeaders(sheet);
+    if (!headers || headers.length === 0) return;
+
+    var editedCol    = range.getColumn();
+    var editedHeader = headers[editedCol - 1] || '';
+    var editedNorm   = normalizeHeader(editedHeader);
+
+    // These fields are message data only; editing them must never queue a message.
+    var editedColumnCount = range.getNumColumns();
+    for (var c = 0; c < editedColumnCount; c++) {
+      var rangeHeader = headers[editedCol - 1 + c] || '';
+      for (var n = 0; n < NON_TRIGGER_EDIT_HEADERS.length; n++) {
+        if (normalizeHeader(rangeHeader) === normalizeHeader(NON_TRIGGER_EDIT_HEADERS[n])) return;
+      }
+    }
+
+    var isStatus       = editedNorm === normalizeHeader(STATUS_TRIGGER_HEADER);
+    var isDetailStatus = editedNorm === normalizeHeader(DETAIL_STATUS_TRIGGER_HEADER);
+    var isFinalStatus  = editedNorm === normalizeHeader(FINAL_STATUS_TRIGGER_HEADER);
+    // Feedback Form column — explicitly ignored, never queues a message
+    var isFeedbackForm = editedNorm === normalizeHeader(FEEDBACK_FORM_HEADER);
+
+    if (!isStatus && !isDetailStatus && !isFinalStatus) return;
+    if (isFeedbackForm) return; // safety guard — should already be excluded above
+    if (typeof e.oldValue !== 'undefined' && e.oldValue === e.value) return;
+
+    var row = range.getRow();
+
+    Logger.log('[Ampaxis] Triggered by "' + editedHeader + '" = "' + e.value + '" in row ' + row);
+
+    var ticketId = ensureTicketId(sheet, headers, row);
+    Logger.log('[Ampaxis] Ticket ID: ' + ticketId);
+
+    headers       = getHeaders(sheet);  // re-read after ticket ID write
+    var rowValues = sheet.getRange(row, 1, 1, headers.length).getValues()[0];
+
+    var customerPhone = getPhoneValue(headers, rowValues);
+    if (!customerPhone) {
+      Logger.log('[Ampaxis] No customer phone in row ' + row + ' — aborting');
+      return;
+    }
+    Logger.log('[Ampaxis] Customer phone: ' + customerPhone);
+
+    var newValue       = String(e.value || '').trim();
+    var newValNorm     = newValue.toLowerCase();
+    var message        = '';
+    var recipientPhone = customerPhone;
+
+    if (isStatus) {
+      var isAssigned = false;
+      for (var a = 0; a < ASSIGNED_STATUS_VALUES.length; a++) {
+        if (newValNorm === ASSIGNED_STATUS_VALUES[a]) { isAssigned = true; break; }
+      }
+      message        = isAssigned
+        ? buildAssignedStatusMessage(headers, rowValues, ticketId, newValue)
+        : buildNotAssignedMessage(headers, rowValues, ticketId, newValue);
+      recipientPhone = customerPhone;
+
+    } else if (isDetailStatus) {
+      var customer = fetchCustomerDetailsByPhone(customerPhone);
+      Logger.log('[Ampaxis] Customer lookup: ' + (customer ? (customer['Contact Person Name'] || 'found') : 'not found'));
+      message = buildDetailStatusMessage(headers, rowValues, ticketId, newValue, customer);
+
+      var techPhoneRaw = getVal(headers, rowValues, 'Technician Phone Number');
+      var techPhone    = normalizePhone(techPhoneRaw);
+      if (!techPhone) {
+        Logger.log('[Ampaxis] Tech Status in row ' + row + ' — no valid Technician Phone Number, message NOT queued.');
+        try { logAutomationEvent('DETAIL_STATUS_NO_TECH_PHONE', ticketId, 'Row ' + row); } catch (_) {}
+        return;
+      }
+      recipientPhone = techPhone;
+
+    } else if (isFinalStatus) {
+      // Final Status: fetch Feedback Form from the same row and combine into one message
+      message        = buildFinalStatusMessage(headers, rowValues, ticketId, newValue);
+      recipientPhone = customerPhone;
+    }
+
+    if (!message) return;
+
+    queueWhatsAppMessage({
+      sheetName     : shName,
+      rowSource     : row,
+      phone         : recipientPhone,
+      message       : message,
+      triggerColumn : editedHeader,
+      oldValue      : e.oldValue || '',
+      newValue      : newValue,
+      ticketId      : ticketId,
+      customer      : null
+    });
+
+  } catch (err) {
+    Logger.log('[Ampaxis] onEdit error: ' + err.message);
+  }
+}
+
+// ============================================================
+// onFormSubmit
+// ============================================================
+
+function onFormSubmit(e) {
+  try {
+    var range = e && e.range ? e.range : null;
+    var sheet = null;
+
+    if (range) {
+      sheet = range.getSheet();
+    } else {
+      var ss = SpreadsheetApp.getActiveSpreadsheet();
+      var maxRow = 0;
+      for (var i = 0; i < DATA_SHEET_NAMES.length; i++) {
+        var sh = ss.getSheetByName(DATA_SHEET_NAMES[i]);
+        if (!sh) continue;
+        var lr = sh.getLastRow();
+        if (lr > maxRow) { maxRow = lr; sheet = sh; }
+      }
+      if (!sheet || maxRow <= HEADER_ROW) return;
+      range = sheet.getRange(maxRow, 1);
+    }
+
+    if (!DATA_SHEET_NAMES.includes(sheet.getName())) return;
+
+    var row = range.getRow();
+    if (row <= HEADER_ROW) return;
+
+    queueNewFormSubmission(sheet, row);
+  } catch (err) {
+    Logger.log('[Ampaxis] onFormSubmit error: ' + err.message);
+  }
+}
+
+function queueNewFormSubmission(sheet, row) {
+  var headers   = getHeaders(sheet);
+  var rowValues = sheet.getRange(row, 1, 1, headers.length).getValues()[0];
+  if (getVal(headers, rowValues, TICKET_ID_HEADER)) return;
+
+  var phone = getPhoneValue(headers, rowValues);
+  if (!phone) return;
+
+  var ticketId = ensureTicketId(sheet, headers, row);
+  headers      = getHeaders(sheet);
+  rowValues    = sheet.getRange(row, 1, 1, headers.length).getValues()[0];
+  var message  = buildNewSubmissionMessage(headers, rowValues, ticketId);
+  if (!message) return;
+
+  queueWhatsAppMessage({
+    sheetName     : sheet.getName(),
+    rowSource     : row,
+    phone         : phone,
+    message       : message,
+    triggerColumn : 'new_submission',
+    oldValue      : '',
+    newValue      : 'new_form_submission',
+    ticketId      : ticketId,
+    customer      : null
+  });
+}
+
+function buildNewSubmissionMessage(headers, rowValues, ticketId) {
+  var mainFault   = getVal(headers, rowValues, 'Main Fault Catagorie') || getVal(headers, rowValues, 'Fault Category') || 'Not yet selected';
+  var description = getVal(headers, rowValues, 'Service Description')  || 'No additional notes provided';
+
+  return '🔔 *Ampaxis AMC — Ticket Received*'
+    + '\n\nDear Customer, thank you for raising your service ticket with Ampaxis AMC.'
+    + '\n\nYour ticket has been successfully received by our team. Our technician team will review your request and contact you shortly.'
+    + '\n\n📋 *Ticket Details:*'
+    + '\n• Ticket ID: *'    + ticketId   + '*'
+    + '\n• Issue Type: '    + mainFault
+    + '\n• Description: '   + description
+    + '\n\nWe appreciate your patience and look forward to assisting you.'
+    + '\n\nThank you for choosing *Ampaxis AMC*.';
+}
+
+// Mirrored/imported rows do not fire onFormSubmit, so find rows not seen before.
+function queueNewFormSubmissions() {
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    for (var i = 0; i < DATA_SHEET_NAMES.length; i++) {
+      var sheet = ss.getSheetByName(DATA_SHEET_NAMES[i]);
+      if (!sheet || sheet.getLastRow() <= HEADER_ROW) continue;
+      var lastRow = sheet.getLastRow();
+      for (var row = HEADER_ROW + 1; row <= lastRow; row++) {
+        queueNewFormSubmission(sheet, row);
+      }
+    }
+  } catch (err) {
+    Logger.log('[Ampaxis] queueNewFormSubmissions error: ' + err.message);
+  }
+}
+
+// ============================================================
+// MESSAGE BUILDERS
+// ============================================================
+
+/*
+ * buildNotAssignedMessage
+ * Status = "Not Assigned" or form new submission.
+ * Not Assigned status message. Assignment details are intentionally omitted.
+ */
+function buildNotAssignedMessage(headers, rowValues, ticketId, newStatus) {
+  var mainFault   = getVal(headers, rowValues, 'Main Fault Catagorie') || getVal(headers, rowValues, 'Fault Category') || 'Not yet selected';
+  var description = getVal(headers, rowValues, 'Service Description')  || 'No additional notes provided';
+  var evidence    = getVal(headers, rowValues, 'Upload Fault Evidence') || '';
+
+  var msg = '🔔 *Ampaxis AMC — Ticket Raised*'
+    + '\n\nDear Customer, we have successfully received your service request. Our team will review it and assign a technician shortly.'
+    + '\n\n📋 *Ticket Details:*'
+    + '\n• Ticket ID: *'    + ticketId   + '*'
+    + '\n• Issue Type: '    + mainFault
+    + '\n• Description: '   + description;
+
+  if (evidence) msg += '\n• Evidence: ' + evidence;
+
+  msg += '\n\n⏳ *Status: ' + newStatus + '*'
+    + '\n\nYou will receive another update once a technician is assigned to your ticket. Thank you for choosing *Ampaxis AMC*.';
+  return msg;
+}
+
+/*
+ * buildAssignedStatusMessage
+ * Status = "Assigned" — includes Technician ID + Technician Phone.
+ */
+function buildAssignedStatusMessage(headers, rowValues, ticketId, newStatus) {
+  var mainFault   = getVal(headers, rowValues, 'Main Fault Catagorie')    || getVal(headers, rowValues, 'Fault Category') || 'Not specified';
+  var assignHours = getVal(headers, rowValues, 'Assign Hours')            || 'To be confirmed';
+  var technician  = getVal(headers, rowValues, 'Assign Technician')       || 'To be confirmed';
+  var date        = formatDate(getVal(headers, rowValues, 'Date and Time') || getVal(headers, rowValues, 'Date'));
+
+  var description = getVal(headers, rowValues, 'Service Description')     || 'No additional notes provided';
+  var techId      = getVal(headers, rowValues, 'Technician Id')           || 'Not yet assigned';
+  var techPhone   = getVal(headers, rowValues, 'Technician Phone Number') || 'Not provided';
+
+  var msg = '✅ *Ampaxis AMC — Technician Assigned*'
+    + '\n\nDear Customer, great news! A technician has been assigned to your service request and will visit you at the scheduled time.'
+    + '\n\n📋 *Ticket Details:*'
+    + '\n• Ticket ID: *'             + ticketId    + '*'
+    + '\n• Issue Type: '             + mainFault
+    + '\n• Description: '            + description;
+
+  msg += '\n\n🗓️ *Schedule:*'
+    + '\n• Scheduled Date & Time: '  + date
+    + '\n• Estimated Hours: '        + assignHours
+
+  msg += '\n\n👷 *Technician Details:*'
+    + '\n• Name: '                   + technician
+    + '\n• Technician ID: '          + techId
+    + '\n• Contact Number: '         + techPhone
+
+  msg += '\n\n🔧 *Status: ' + newStatus + '*'
+    + '\n\nPlease ensure someone is available at the premises at the scheduled time. For any queries, you can contact the technician directly on the number above.'
+    + '\n\nThank you for choosing *Ampaxis AMC*.';
+  return msg;
+}
+
+/*
+ * buildDetailStatusMessage
+ * Tech Status changes — sent to the TECHNICIAN phone with full customer details.
+ */
+function buildDetailStatusMessage(headers, rowValues, ticketId, newDetailStatus, customer) {
+  var mainFault    = getVal(headers, rowValues, 'Main Fault Catagorie') || getVal(headers, rowValues, 'Fault Category') || 'Not specified';
+  var assignHours  = getVal(headers, rowValues, 'Assign Hours')         || 'As discussed';
+  var date         = formatDate(getVal(headers, rowValues, 'Date and Time') || getVal(headers, rowValues, 'Date'));
+  var description  = getVal(headers, rowValues, 'Service Description')  || 'No additional notes';
+  var evidence     = getVal(headers, rowValues, 'Upload Fault Evidence') || '';
+  var status       = getVal(headers, rowValues, 'Status')               || 'In Progress';
+  var detailStatus = newDetailStatus || getVal(headers, rowValues, 'Tech Status') || 'Updated';
+
+  var custName  = (customer && customer['Contact Person Name'])   || 'N/A';
+  var custPhone = (customer && customer['Contact Person Number']) || 'N/A';
+  var amcType   = (customer && customer['AMC Type'])              || 'N/A';
+  var bhkConn   = (customer && customer['BHK Connection'])        || 'N/A';
+  var premises  = (customer && customer['Premises Details'])      || 'N/A';
+  var sqft      = (customer && customer['Building Square Feet'])  || 'N/A';
+  var floor     = (customer && customer['Floor Number'])          || 'N/A';
+  var ownership = (customer && customer['Ownership'])             || 'N/A';
+  var address   = (customer && customer['Address'])               || 'N/A';
+  var area      = (customer && customer['Area'])                  || 'N/A';
+  var city      = (customer && customer['City'])                  || 'N/A';
+  var state     = (customer && customer['State'])                 || 'N/A';
+  var location  = (customer && customer['Location'])              || 'N/A';
+
+  var msg = '🛠️ *Ampaxis AMC — Job Update for Technician*'
+    + '\n\nDear Technician, here is the latest update and customer information for your assigned ticket.'
+    + '\n\n📋 *Ticket Details:*'
+    + '\n• Ticket ID: *'           + ticketId    + '*'
+    + '\n• Issue Type: '           + mainFault
+    + '\n• Description: '          + description
+    + '\n• Scheduled Date & Time: '+ date
+    + '\n• Estimated Hours: '      + assignHours
+    + '\n• Status: '               + status
+    + '\n• Tech Status: *'       + detailStatus + '*';
+
+  if (evidence) msg += '\n• Evidence: ' + evidence;
+
+  msg += '\n\n👤 *Customer Information:*'
+    + '\n• Name: '              + custName
+    + '\n• Contact: '           + custPhone
+    + '\n• AMC Type: '          + amcType
+    + '\n• Premises: '          + premises
+    + '\n• Area (sq. ft): '     + sqft
+    + '\n• Floor: '             + floor
+    + '\n• Ownership: '         + ownership
+    + '\n• Address: '           + address
+    + ', ' + area + ', ' + city + ', ' + state
+    + '\n• Location Link: '     + location;
+
+  msg += '\n\nPlease proceed to the customer location at the scheduled time. For any queries, contact the Ampaxis AMC team. Thank you! 🙏';
+  return msg;
+}
+
+// ============================================================
+// FINAL STATUS MESSAGE BUILDER
+// ============================================================
+
+/*
+ * FINAL_STATUS_MESSAGES
+ * ---------------------------------------------------------------
+ * Add new Final Status values here any time without touching
+ * any other code. Key = normalizeHeader(statusText) so casing
+ * and punctuation variations always match the right template.
+ * Any value NOT listed below uses buildDefaultFinalStatusMessage()
+ * — a clean fallback so the automation NEVER breaks on a new value.
+ * ---------------------------------------------------------------
+ */
+const FINAL_STATUS_MESSAGES = {
+
+  completed: {
+    build: function (ctx) {
+      var msg = '🎉 *Ampaxis AMC — Service Completed!*'
+        + '\n\nDear Customer, we are delighted to inform you that your electrical service request has been *successfully completed* by our technician.'
+        + '\n\n📋 *Service Summary:*'
+        + '\n• Ticket ID: *'       + ctx.ticketId    + '*'
+        + '\n• Issue Resolved: '   + ctx.mainFault
+        + '\n• Technician: '       + ctx.technician
+        + '\n• Completed On: '     + ctx.date
+        + '\n• Final Status: ✅ Completed';
+
+      if (ctx.feedback) {
+        msg += '\n\n💬 *Your Feedback:*'
+          + '\n"' + ctx.feedback + '"'
+          + '\n\nThank you for taking the time to share your experience. Your feedback helps us serve you better.';
+      } else {
+        msg += '\n\n⭐ *Share Your Experience*'
+          + '\nWe hope our technician met your expectations. We would love to hear from you — please take a moment to rate our service and share your feedback.';
+      }
+
+      msg += '\n\nIt was a pleasure serving you. We look forward to being your trusted partner for all your electrical needs. 🙏'
+        + '\n\n— *Ampaxis AMC Team*';
+      return msg;
+    }
+  },
+
+  holded: {
+    build: function (ctx) {
+      var msg = '⏸️ *Ampaxis AMC — Service Temporarily On Hold*'
+        + '\n\nDear Customer, we would like to inform you that your service request has been *placed on hold* temporarily.'
+        + '\n\n📋 *Ticket Details:*'
+        + '\n• Ticket ID: *'     + ctx.ticketId + '*'
+        + '\n• Issue Type: '     + ctx.mainFault
+        + '\n• Final Status: ⏸️ On Hold';
+
+      if (ctx.feedback) {
+        msg += '\n• Reason: '    + ctx.feedback;
+      }
+
+      msg += '\n\nOur team is working to address the pending requirements and will resume the service at the earliest. We sincerely apologise for the delay and appreciate your understanding.'
+        + '\n\nYou will be notified as soon as work resumes on your ticket.'
+        + '\n\n— *Ampaxis AMC Team*';
+      return msg;
+    }
+  },
+
+  pending: {
+    build: function (ctx) {
+      var msg = '⏳ *Ampaxis AMC — Service Pending*'
+        + '\n\nDear Customer, your service request is currently *pending* and is being prioritised by our team.'
+        + '\n\n📋 *Ticket Details:*'
+        + '\n• Ticket ID: *'     + ctx.ticketId + '*'
+        + '\n• Issue Type: '     + ctx.mainFault
+        + '\n• Technician: '     + ctx.technician
+        + '\n• Final Status: ⏳ Pending';
+
+      if (ctx.feedback) {
+        msg += '\n• Notes: '     + ctx.feedback;
+      }
+
+      msg += '\n\nWe understand your time is valuable and assure you that our team is actively working to resolve this at the earliest. We will keep you updated with any progress.'
+        + '\n\nThank you for your patience. 🙏'
+        + '\n\n— *Ampaxis AMC Team*';
+      return msg;
+    }
+  },
+
+  rejected: {
+    build: function (ctx) {
+      var msg = '❌ *Ampaxis AMC — Service Request Not Processed*'
+        + '\n\nDear Customer, we regret to inform you that your service request could not be processed at this time.'
+        + '\n\n📋 *Ticket Details:*'
+        + '\n• Ticket ID: *'     + ctx.ticketId + '*'
+        + '\n• Issue Type: '     + ctx.mainFault
+        + '\n• Final Status: ❌ Rejected';
+
+      if (ctx.feedback) {
+        msg += '\n• Reason: '    + ctx.feedback;
+      }
+
+      msg += '\n\nIf you believe this was raised in error or would like to raise a new request, please do not hesitate to contact our support team — we will be happy to assist you.'
+        + '\n\nWe apologise for any inconvenience caused.'
+        + '\n\n— *Ampaxis AMC Team*';
+      return msg;
+    }
+  }
+
+};
+
+/*
+ * buildDefaultFinalStatusMessage
+ * Used for any Final Status value not yet listed in FINAL_STATUS_MESSAGES.
+ * Keeps automation running cleanly for future dropdown values.
+ */
+function buildDefaultFinalStatusMessage(ctx) {
+  var msg = '📢 *Ampaxis AMC — Ticket Status Update*'
+    + '\n\nDear Customer, there is an update on your service request.'
+    + '\n\n📋 *Ticket Details:*'
+    + '\n• Ticket ID: *'       + ctx.ticketId       + '*'
+    + '\n• Issue Type: '       + ctx.mainFault
+    + '\n• Technician: '       + ctx.technician
+    + '\n• Final Status: '     + (ctx.finalStatusRaw || 'Updated');
+
+  if (ctx.feedback) {
+    msg += '\n\n💬 *Notes:*\n' + ctx.feedback;
+  }
+
+  msg += '\n\nFor any queries, please feel free to reach out to our team.'
+    + '\n\nThank you for choosing *Ampaxis AMC*. 🙏';
+  return msg;
+}
+
+/*
+ * buildFinalStatusMessage
+ * Entry point called from onEdit when Final Status column changes.
+ * Reads Feedback Form from the SAME row and combines it into one message.
+ * Picks the right template from FINAL_STATUS_MESSAGES or falls back safely.
+ */
+function buildFinalStatusMessage(headers, rowValues, ticketId, newFinalStatus) {
+  var mainFault      = getVal(headers, rowValues, 'Main Fault Catagorie') || getVal(headers, rowValues, 'Fault Category') || 'Not specified';
+  var technician     = getVal(headers, rowValues, 'Assign Technician')    || 'Our Technician';
+  var description    = getVal(headers, rowValues, 'Service Description')  || '';
+  var date           = formatDate(getVal(headers, rowValues, 'Date and Time') || getVal(headers, rowValues, 'Date'));
+  var feedback       = getVal(headers, rowValues, FEEDBACK_FORM_HEADER)   || ''; // fetched now, combined in message
+  var finalStatusRaw = newFinalStatus || getVal(headers, rowValues, FINAL_STATUS_TRIGGER_HEADER) || '';
+
+  var ctx = {
+    ticketId       : ticketId,
+    mainFault      : mainFault,
+    technician     : technician,
+    description    : description,
+    date           : date,
+    feedback       : feedback,       // included in message if filled, gracefully skipped if empty
+    finalStatusRaw : finalStatusRaw
+  };
+
+  var key   = normalizeHeader(finalStatusRaw);
+  var entry = FINAL_STATUS_MESSAGES[key];
+
+  if (entry && typeof entry.build === 'function') {
+    return entry.build(ctx);
+  }
+
+  // Unknown / future status — still sends a clean, professional message
+  Logger.log('[Ampaxis] Final Status "' + finalStatusRaw + '" has no dedicated template — using default.');
+  return buildDefaultFinalStatusMessage(ctx);
+}
+
+// ============================================================
+// TICKET ID — AMP-YYYYMMDD-001 format, unique, auto-increment
+// ============================================================
+
+function ensureTicketId(sheet, headers, rowNumber) {
+  var ticketColIndex = -1;
+  var candidates = [TICKET_ID_HEADER, 'Ticket ID', 'TicketID', 'Ticket Number'];
+  for (var i = 0; i < headers.length; i++) {
+    for (var j = 0; j < candidates.length; j++) {
+      if (normalizeHeader(headers[i]) === normalizeHeader(candidates[j])) {
+        ticketColIndex = i + 1; break;
+      }
+    }
+    if (ticketColIndex !== -1) break;
+  }
+  if (ticketColIndex === -1) {
+    ticketColIndex = sheet.getLastColumn() + 1;
+    sheet.getRange(HEADER_ROW, ticketColIndex).setValue(TICKET_ID_HEADER);
+  }
+  var cell     = sheet.getRange(rowNumber, ticketColIndex);
+  var existing = String(cell.getValue() || '').trim();
+  if (existing) return existing;
+  var newId = generateTicketId(sheet, ticketColIndex);
+  try { cell.setValue(newId); } catch (_) {}
+  return newId;
+}
+
+function generateTicketId(sheet, ticketColIndex) {
+  var dateStr    = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyyMMdd');
+  var prefix     = TICKET_ID_PREFIX + '-' + dateStr + '-';
+  var maxCounter = 0;
+  var lastRow    = sheet.getLastRow();
+
+  if (lastRow > HEADER_ROW && ticketColIndex) {
+    var existingIds = sheet.getRange(HEADER_ROW + 1, ticketColIndex, lastRow - HEADER_ROW, 1).getValues();
+    for (var i = 0; i < existingIds.length; i++) {
+      var val = String(existingIds[i][0] || '').trim();
+      if (val.startsWith(prefix)) {
+        var counter = parseInt(val.replace(prefix, ''), 10);
+        if (!isNaN(counter) && counter > maxCounter) maxCounter = counter;
+      }
+    }
+  }
+  try {
+    var qSheet = SpreadsheetApp.openById(QUEUE_SPREADSHEET_ID).getSheetByName(QUEUE_SHEET_NAME);
+    if (qSheet && qSheet.getLastRow() > 1) {
+      var qIds = qSheet.getRange(2, 11, qSheet.getLastRow() - 1, 1).getValues();
+      for (var i = 0; i < qIds.length; i++) {
+        var val = String(qIds[i][0] || '').trim();
+        if (val.startsWith(prefix)) {
+          var counter = parseInt(val.replace(prefix, ''), 10);
+          if (!isNaN(counter) && counter > maxCounter) maxCounter = counter;
+        }
+      }
+    }
+  } catch (_) {}
+
+  var next   = maxCounter + 1;
+  var padded = next < 10 ? '00' + next : next < 100 ? '0' + next : String(next);
+  return prefix + padded;
+}
+
+// ============================================================
+// CUSTOMER FETCH
+// ============================================================
+
+function fetchCustomerDetailsByPhone(phone) {
+  if (!phone) return null;
+  var webAppUrl = (CUSTOMER_DETAIL_WEB_APP_URL || '').toString().trim();
+  if (webAppUrl) {
+    try {
+      var url      = webAppUrl + '?action=getCustomerByPhone&phone=' + encodeURIComponent(phone);
+      var response = UrlFetchApp.fetch(url, { method: 'get', muteHttpExceptions: true, followRedirects: true });
+      var code     = response.getResponseCode();
+      var text     = response.getContentText();
+      Logger.log('[CustomerFetch] HTTP ' + code + ' → ' + text.substring(0, 200));
+      if (code >= 200 && code < 300) {
+        var parsed = JSON.parse(text);
+        if (parsed && parsed.success && parsed.data) {
+          Logger.log('[CustomerFetch] ✅ ' + (parsed.data['Contact Person Name'] || 'Unknown'));
+          return parsed.data;
+        }
+      }
+    } catch (err) {
+      Logger.log('[CustomerFetch] ❌ Web App failed: ' + err.message);
+      try { logAutomationEvent('CUSTOMER_LOOKUP_ERROR', '', err.message); } catch (_) {}
+    }
+  }
+  try {
+    var remote          = SpreadsheetApp.openById(CUSTOMER_DETAIL_SPREADSHEET_ID);
+    var sheets          = remote.getSheets();
+    var normalizedPhone = normalizePhone(phone);
+    for (var s = 0; s < sheets.length; s++) {
+      var sh      = sheets[s];
+      var headers = getHeaders(sh);
+      if (!headers || headers.length === 0) continue;
+      var phoneColIndexes = [];
+      for (var h = 0; h < headers.length; h++) {
+        var c = normalizeHeader(headers[h]);
+        if (c === 'contactpersonnumber' || c === 'registermobilenumber' ||
+            c === 'registeredmobilenumber' || c === 'mobilenumber' ||
+            c === 'phonenumber' || c === 'mobile' || c === 'phone') {
+          phoneColIndexes.push(h);
+        }
+      }
+      if (phoneColIndexes.length === 0) continue;
+      var lastRow = sh.getLastRow();
+      if (lastRow <= 1) continue;
+      var rows = sh.getRange(2, 1, lastRow - 1, headers.length).getValues();
+      var matchedRows = [];
+      for (var r = 0; r < rows.length; r++) {
+        for (var p = 0; p < phoneColIndexes.length; p++) {
+          if (normalizePhone(rows[r][phoneColIndexes[p]]) === normalizedPhone) {
+            matchedRows.push(rows[r]); break;
+          }
+        }
+      }
+      if (matchedRows.length === 0) continue;
+      var bestRow = matchedRows[0]; var bestScore = 0;
+      for (var m = 0; m < matchedRows.length; m++) {
+        var score = matchedRows[m].filter(function(v) { return v !== '' && v !== null && v !== undefined; }).length;
+        if (score > bestScore) { bestScore = score; bestRow = matchedRows[m]; }
+      }
+      var headerMap = {};
+      for (var h = 0; h < headers.length; h++) {
+        if (!headers[h]) continue;
+        var key = normalizeHeader(headers[h]);
+        if (!headerMap[key]) headerMap[key] = [];
+        headerMap[key].push(h);
+      }
+      var out = {};
+      for (var f = 0; f < CUSTOMER_DETAIL_FIELDS.length; f++) {
+        var field   = CUSTOMER_DETAIL_FIELDS[f];
+        var indexes = headerMap[normalizeHeader(field)] || [];
+        var chosen  = '';
+        for (var idx = 0; idx < indexes.length; idx++) {
+          var v = bestRow[indexes[idx]];
+          if (v !== '' && v !== null && v !== undefined) { chosen = v; break; }
+        }
+        out[field] = chosen;
+      }
+      Logger.log('[CustomerFetch] ✅ Fallback: ' + (out['Contact Person Name'] || 'Unknown'));
+      return out;
+    }
+  } catch (err) {
+    Logger.log('[CustomerFetch] ❌ Fallback failed: ' + err.message);
+    try { logAutomationEvent('CUSTOMER_LOOKUP_ERROR', '', err.message); } catch (_) {}
+  }
+  return null;
+}
+
+// ============================================================
+// DATE FORMATTER
+// ============================================================
+
+/*
+ * formatDate — converts raw cell value (Date object or string) into a
+ * clean, readable format like "28 Jul 2026, 10:00 AM" rather than the
+ * raw ISO / GMT string that Google Sheets stores internally.
+ */
+function formatDate(rawValue) {
+  if (!rawValue) return 'To be scheduled';
+  try {
+    var d = (rawValue instanceof Date) ? rawValue : new Date(rawValue);
+    if (isNaN(d.getTime())) return String(rawValue);
+    return Utilities.formatDate(d, Session.getScriptTimeZone(), 'dd MMM yyyy, hh:mm a');
+  } catch (_) {
+    return String(rawValue);
+  }
+}
+
+// ============================================================
+// QUEUE
+// ============================================================
+
+function getQueueSheet() {
+  var ss;
+  try {
+    ss = SpreadsheetApp.openById(QUEUE_SPREADSHEET_ID);
+  } catch (err) {
+    // IMPORTANT: do NOT fail silently here. If the account running this
+    // script doesn't have access to QUEUE_SPREADSHEET_ID (very likely the
+    // first time this is pasted into a new Google account/computer), we
+    // used to fall back to the bound spreadsheet with no warning at all —
+    // meaning messages would get queued in the wrong place and the
+    // WhatsApp sender would simply never see them, with no visible error.
+    // Now we log it loudly so the problem is obvious immediately.
+    Logger.log('[Ampaxis] ⚠️ CANNOT OPEN QUEUE_SPREADSHEET_ID (' + QUEUE_SPREADSHEET_ID + '): ' + err.message
+      + ' — falling back to the bound spreadsheet. Share the queue spreadsheet with this script\'s '
+      + 'Google account, or update QUEUE_SPREADSHEET_ID, then re-run runSetupCheck().');
+    try { logAutomationEvent('QUEUE_SHEET_FALLBACK', '', 'Could not open QUEUE_SPREADSHEET_ID: ' + err.message); } catch (_) {}
+    ss = SpreadsheetApp.getActiveSpreadsheet();
+  }
+  var sheet = ss.getSheetByName(QUEUE_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(QUEUE_SHEET_NAME);
+    sheet.appendRow(['QueueId','CreatedAt','Sheet','Row','Phone','Message',
+                     'TriggerColumn','Status','SentAt','FailedReason','TicketId','CustomerDetails']);
+  }
+  return sheet;
+}
+
+function queueWhatsAppMessage(payload) {
+  var sheet = getQueueSheet();
+  try {
+    var lastRow = sheet.getLastRow();
+    if (lastRow > 1) {
+      var rows = sheet.getRange(2, 1, lastRow - 1, 12).getValues();
+      for (var i = 0; i < rows.length; i++) {
+        var r = rows[i];
+        if ((r[7] === WA_STATUS_PENDING || r[7] === WA_STATUS_QUEUED) &&
+            r[2] === (payload.sheetName || '') &&
+            String(r[3]) === String(payload.rowSource || '') &&
+            String(r[6]) === String(payload.triggerColumn || '') &&
+            String(r[4]) === String(payload.phone || '')) {
+          sheet.getRange(i + 2, 6).setValue(payload.message || '');
+          try { logAutomationEvent('DUPLICATE_UPDATED', r[0], 'Refreshed'); } catch (_) {}
+          return r[0];
+        }
+      }
+    }
+  } catch (__) {}
+
+  var queueId = 'Q' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+  sheet.appendRow([
+    queueId, new Date().toISOString(),
+    payload.sheetName || '', payload.rowSource || '',
+    payload.phone || '', payload.message || '',
+    payload.triggerColumn || '', WA_STATUS_PENDING,
+    '', '', payload.ticketId || '', ''
+  ]);
+  logAutomationEvent('QUEUED', queueId, 'Phone: ' + (payload.phone || ''));
+  return queueId;
+}
+
+/*
+ * getAndDispatchPendingMessages
+ * ---------------------------------------------------------------
+ * THE FIX for duplicate WhatsApp sends.
+ *
+ * Old behaviour: doGet() returned any row that was PENDING *or*
+ * QUEUED, but nothing ever set a row to QUEUED — so a row stayed
+ * PENDING until the sender script finished sending AND called
+ * markSent(). If your sender polled again before that round trip
+ * completed, it received the exact same PENDING row a second time
+ * and sent it twice.
+ *
+ * New behaviour: this runs inside a script lock, reads only rows
+ * that are still PENDING, and immediately stamps them QUEUED
+ * before returning them. Any overlapping/concurrent poll will now
+ * see QUEUED (not PENDING) and skip them — so the same message can
+ * never be handed out twice while it's in flight.
+ * ---------------------------------------------------------------
+ */
+function getAndDispatchPendingMessages(limit) {
+  var lock = LockService.getScriptLock();
+  var out  = [];
+  try {
+    lock.waitLock(30000); // wait up to 30s for any other run to finish
+  } catch (lockErr) {
+    Logger.log('[Ampaxis] Could not acquire lock: ' + lockErr.message);
+    logAutomationEvent('LOCK_TIMEOUT', '', 'getAndDispatchPendingMessages');
+    return out; // bail out empty rather than risk a double-fetch
+  }
+
+  try {
+    var sheet   = getQueueSheet();
+    var lastRow = sheet.getLastRow();
+    if (lastRow <= 1) return out;
+
+    var rows = sheet.getRange(2, 1, lastRow - 1, 12).getValues();
+    var rowsToClaim = [];
+
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i][7] === WA_STATUS_PENDING) {
+        out.push({
+          queueId        : rows[i][0],
+          phone          : rows[i][4],
+          recipientNumber: rows[i][4],
+          message        : rows[i][5],
+          triggerColumn  : rows[i][6],
+          row            : rows[i][3],
+          ticketId       : rows[i][10] || ''
+        });
+        rowsToClaim.push(i + 2); // sheet row number
+        if (limit && out.length >= limit) break;
+      }
+    }
+
+    // Immediately claim these rows so no other run can hand them out again.
+    var now = new Date().toISOString();
+    for (var c = 0; c < rowsToClaim.length; c++) {
+      sheet.getRange(rowsToClaim[c], 8).setValue(WA_STATUS_QUEUED); // Status
+      sheet.getRange(rowsToClaim[c], 9).setValue(now);              // SentAt column reused as "QueuedAt" timestamp for now
+    }
+
+    if (rowsToClaim.length > 0) {
+      logAutomationEvent('DISPATCHED', '', rowsToClaim.length + ' message(s) claimed as QUEUED');
+    }
+  } catch (err) {
+    Logger.log('[Ampaxis] getAndDispatchPendingMessages error: ' + err.message);
+  } finally {
+    try { lock.releaseLock(); } catch (_) {}
+  }
+
+  return out;
+}
+
+/*
+ * resetStaleQueuedMessages
+ * ---------------------------------------------------------------
+ * Safety net: if a message has been sitting in QUEUED for longer
+ * than STALE_QUEUE_MINUTES, the sender script likely crashed or
+ * timed out before calling markSent/markFailed. This reverts it
+ * back to PENDING so it gets picked up and sent on the next poll
+ * instead of being stuck forever.
+ *
+ * Recommended: attach this to a time-driven trigger every
+ * 10-15 minutes (Apps Script editor → Triggers → Add Trigger →
+ * resetStaleQueuedMessages → Time-driven → Minutes timer).
+ * ---------------------------------------------------------------
+ */
+function resetStaleQueuedMessages() {
+  var lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(30000);
+  } catch (lockErr) {
+    Logger.log('[Ampaxis] resetStaleQueuedMessages could not acquire lock: ' + lockErr.message);
+    return;
+  }
+
+  try {
+    var sheet   = getQueueSheet();
+    var lastRow = sheet.getLastRow();
+    if (lastRow <= 1) return;
+
+    var rows      = sheet.getRange(2, 1, lastRow - 1, 12).getValues();
+    var thresholdMs = STALE_QUEUE_MINUTES * 60 * 1000;
+    var now         = Date.now();
+    var resetCount  = 0;
+
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i][7] !== WA_STATUS_QUEUED) continue;
+      var queuedAtRaw = rows[i][8]; // SentAt column doubling as QueuedAt while status is QUEUED
+      var queuedAtMs  = queuedAtRaw ? new Date(queuedAtRaw).getTime() : 0;
+      if (!queuedAtMs || (now - queuedAtMs) > thresholdMs) {
+        sheet.getRange(i + 2, 8).setValue(WA_STATUS_PENDING); // Status
+        sheet.getRange(i + 2, 9).setValue('');                // clear the QueuedAt stamp
+        resetCount++;
+      }
+    }
+
+    if (resetCount > 0) {
+      logAutomationEvent('STALE_QUEUE_RESET', '', resetCount + ' message(s) reverted to PENDING');
+      Logger.log('[Ampaxis] resetStaleQueuedMessages: reverted ' + resetCount + ' stale QUEUED message(s)');
+    }
+  } catch (err) {
+    Logger.log('[Ampaxis] resetStaleQueuedMessages error: ' + err.message);
+  } finally {
+    try { lock.releaseLock(); } catch (_) {}
+  }
+}
+
+/*
+ * getPendingMessages — read-only inspection helper (used by the
+ * 'getQueue' doPost action). Does NOT claim/dispatch rows, so it is
+ * safe to call any time without affecting what the sender picks up.
+ * Kept separate from getAndDispatchPendingMessages on purpose.
+ */
+function getPendingMessages(limit) {
+  var sheet   = getQueueSheet();
+  var lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return [];
+  var rows = sheet.getRange(2, 1, lastRow - 1, 12).getValues();
+  var out  = [];
+  for (var i = 0; i < rows.length; i++) {
+    if (rows[i][7] === WA_STATUS_PENDING || rows[i][7] === WA_STATUS_QUEUED) {
+      out.push({ queueId: rows[i][0], phone: rows[i][4], recipientNumber: rows[i][4],
+                 message: rows[i][5], triggerColumn: rows[i][6], row: rows[i][3],
+                 ticketId: rows[i][10] || '' });
+      if (limit && out.length >= limit) break;
+    }
+  }
+  return out;
+}
+
+function markWhatsAppSent(queueId)           { return updateQueueStatus(queueId, WA_STATUS_SENT,   ''); }
+function markWhatsAppFailed(queueId, reason) { return updateQueueStatus(queueId, WA_STATUS_FAILED, reason); }
+
+function updateQueueStatus(queueId, status, reason) {
+  var sheet   = getQueueSheet();
+  var lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return { success: false, error: 'No queue rows' };
+  var rows = sheet.getRange(2, 1, lastRow - 1, 12).getValues();
+  for (var i = 0; i < rows.length; i++) {
+    if (rows[i][0] === queueId) {
+      sheet.getRange(i + 2, 8).setValue(status);
+      if (status === WA_STATUS_SENT)   sheet.getRange(i + 2, 9).setValue(new Date().toISOString());
+      if (status === WA_STATUS_FAILED) sheet.getRange(i + 2, 10).setValue(reason);
+      logAutomationEvent(status, queueId, reason || 'Updated to ' + status);
+      return { success: true };
+    }
+  }
+  return { success: false, error: 'QueueId not found' };
+}
+
+// ============================================================
+// HELPERS
+// ============================================================
+
+function getHeaders(sheet) {
+  var lastCol = sheet.getLastColumn();
+  if (!lastCol || lastCol < 1) return [];
+  return sheet.getRange(HEADER_ROW, 1, 1, lastCol).getValues()[0]
+    .map(function(h) { return String(h || '').trim(); });
+}
+
+function normalizeHeader(value) {
+  return String(value || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
+function getVal(headers, rowValues, headerName) {
+  if (!headers || !rowValues || !headerName) return '';
+  var target = normalizeHeader(headerName);
+  for (var i = 0; i < headers.length; i++) {
+    if (normalizeHeader(headers[i]) === target) {
+      var v = rowValues[i];
+      return (v !== null && v !== undefined) ? String(v).trim() : '';
+    }
+  }
+  return '';
+}
+
+function getPhoneValue(headers, rowValues) {
+  var candidates = [
+    PHONE_HEADER, 'Phone Number', 'Mobile Number', 'WhatsApp Number',
+    'Register Phone Number', 'Registered Mobile Number', 'Register Mobile',
+    'Phone', 'Mobile', 'Contact Number', 'Contact Person Number', 'Contact'
+  ];
+  for (var i = 0; i < candidates.length; i++) {
+    var v = getVal(headers, rowValues, candidates[i]);
+    if (v) { var n = normalizePhone(v); if (n) return n; }
+  }
+  for (var i = 0; i < headers.length; i++) {
+    var h = normalizeHeader(headers[i]);
+    if (h.indexOf('mobile') >= 0 || h.indexOf('phone') >= 0) {
+      var v = rowValues[i];
+      if (v) { var n = normalizePhone(v); if (n) return n; }
+    }
+  }
+  return '';
+}
+
+function normalizePhone(value) {
+  if (!value) return '';
+  var cleaned = String(value).replace(/[^0-9+]/g, '');
+  if (cleaned.startsWith('+')) cleaned = cleaned.slice(1);
+  if (cleaned.length === 11 && cleaned.startsWith('0')) cleaned = cleaned.slice(1);
+  if (cleaned.length === 10) cleaned = '91' + cleaned;
+  if (cleaned.length > 10) cleaned = cleaned.replace(/^0+/, '');
+  return cleaned;
+}
+
+// ============================================================
+// LOG
+// ============================================================
+
+function getLogSheet() {
+  var ss    = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName('AUTOMATION LOG');
+  if (!sheet) {
+    sheet = ss.insertSheet('AUTOMATION LOG');
+    sheet.appendRow(['Timestamp', 'Type', 'QueueId', 'Details']);
+  }
+  return sheet;
+}
+
+function logAutomationEvent(type, queueId, details) {
+  try { getLogSheet().appendRow([new Date().toISOString(), type, queueId || '', details || '']); }
+  catch (_) {}
+}
+
+// ============================================================
+// WEB APP
+// ============================================================
+
+function doGet(e) {
+  try { logAutomationEvent('WEBAPP_REQUEST', '', 'doGet'); } catch (__) {}
+  var pending = getAndDispatchPendingMessages();
+  return jsonResponse({ success: true, data: pending, queue: pending,
+    message: pending.length ? 'Pending messages found.' : 'No pending messages.' });
+}
+
+function doPost(e) {
+  try {
+    var payload = e.postData && e.postData.type === 'application/json'
+      ? JSON.parse(e.postData.contents) : {};
+    if (!payload || !payload.action) return jsonResponse({ success: false, error: 'Missing action.' });
+    if (payload.action === 'getQueue')                                     return jsonResponse({ success: true, queue: getPendingMessages() });
+    if (payload.action === 'markSent'   || payload.action === 'markProcessed') return jsonResponse(markWhatsAppSent(payload.queueId));
+    if (payload.action === 'markFailed' || payload.action === 'markError') return jsonResponse(markWhatsAppFailed(payload.queueId, payload.reason || 'Failed'));
+    return jsonResponse({ success: false, error: 'Unknown action.' });
+  } catch (err) {
+    return jsonResponse({ success: false, error: err.message });
+  }
+}
+
+function jsonResponse(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+}
+
+// ============================================================
+// TRIGGER INSTALLERS
+// ============================================================
+
+function installAllTriggers() {
+  try {
+    var triggers = ScriptApp.getProjectTriggers();
+    for (var i = 0; i < triggers.length; i++) {
+      var fn = triggers[i].getHandlerFunction();
+      if (fn === 'onEdit' || fn === 'onFormSubmit' || fn === 'queueNewFormSubmissions' || fn === 'resetStaleQueuedMessages') {
+        try { ScriptApp.deleteTrigger(triggers[i]); } catch (__) {}
+      }
+    }
+    ScriptApp.newTrigger('onEdit').forSpreadsheet(SpreadsheetApp.getActiveSpreadsheet()).onEdit().create();
+    ScriptApp.newTrigger('onFormSubmit').forSpreadsheet(SpreadsheetApp.getActiveSpreadsheet()).onFormSubmit().create();
+    ScriptApp.newTrigger('queueNewFormSubmissions').timeBased().everyMinutes(1).create();
+    ScriptApp.newTrigger('resetStaleQueuedMessages').timeBased().everyMinutes(10).create();
+    return { success: true, message: 'Installed onEdit, onFormSubmit, mirrored-row scanner (every 1 min), and resetStaleQueuedMessages (every 10 min) triggers.' };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+}
+
+function installOnEditTrigger() {
+  try {
+    ScriptApp.newTrigger('onEdit').forSpreadsheet(SpreadsheetApp.getActiveSpreadsheet()).onEdit().create();
+    return { success: true, message: 'onEdit trigger installed.' };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+}
+
+function installFormSubmitTrigger() {
+  try {
+    ScriptApp.newTrigger('onFormSubmit').forSpreadsheet(SpreadsheetApp.getActiveSpreadsheet()).onFormSubmit().create();
+    return { success: true, message: 'onFormSubmit trigger installed.' };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+}
+
+function installStaleQueueResetTrigger() {
+  try {
+    ScriptApp.newTrigger('resetStaleQueuedMessages').timeBased().everyMinutes(10).create();
+    return { success: true, message: 'resetStaleQueuedMessages trigger installed (every 10 min).' };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+}
+
+// ============================================================
+// TEST FUNCTIONS
+// ============================================================
+
+function testNotAssignedMessage() {
+  var ss    = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(DATA_SHEET_NAMES[0]);
+  if (!sheet) { Logger.log('❌ Sheet not found: ' + DATA_SHEET_NAMES[0]); return; }
+  var headers   = getHeaders(sheet);
+  var rowValues = sheet.getRange(2, 1, 1, headers.length).getValues()[0];
+  var ticketId  = getVal(headers, rowValues, TICKET_ID_HEADER) || 'AMP-TEST-001';
+  Logger.log('=== NOT ASSIGNED MESSAGE ===\n' + buildNotAssignedMessage(headers, rowValues, ticketId, 'Not Assigned'));
+}
+
+function testAssignedStatusMessage() {
+  var ss    = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(DATA_SHEET_NAMES[0]);
+  if (!sheet) { Logger.log('❌ Sheet not found: ' + DATA_SHEET_NAMES[0]); return; }
+  var headers   = getHeaders(sheet);
+  var rowValues = sheet.getRange(2, 1, 1, headers.length).getValues()[0];
+  var ticketId  = getVal(headers, rowValues, TICKET_ID_HEADER) || 'AMP-TEST-001';
+  Logger.log('=== ASSIGNED STATUS MESSAGE ===\n' + buildAssignedStatusMessage(headers, rowValues, ticketId, 'Assigned'));
+}
+
+function testDetailStatusMessage() {
+  var ss    = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(DATA_SHEET_NAMES[0]);
+  if (!sheet) { Logger.log('❌ Sheet not found: ' + DATA_SHEET_NAMES[0]); return; }
+  var headers   = getHeaders(sheet);
+  var rowValues = sheet.getRange(2, 1, 1, headers.length).getValues()[0];
+  var phone     = getPhoneValue(headers, rowValues);
+  var customer  = fetchCustomerDetailsByPhone(phone);
+  var ticketId  = getVal(headers, rowValues, TICKET_ID_HEADER) || 'AMP-TEST-001';
+  Logger.log('=== DETAIL STATUS MESSAGE (to Technician) ===\n' + buildDetailStatusMessage(headers, rowValues, ticketId, 'Work In Progress', customer));
+}
+
+function testFinalStatusMessages() {
+  var ss    = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(DATA_SHEET_NAMES[0]);
+  if (!sheet) { Logger.log('❌ Sheet not found: ' + DATA_SHEET_NAMES[0]); return; }
+  var headers   = getHeaders(sheet);
+  var rowValues = sheet.getRange(2, 1, 1, headers.length).getValues()[0];
+  var ticketId  = getVal(headers, rowValues, TICKET_ID_HEADER) || 'AMP-TEST-001';
+  ['Completed', 'Holded', 'Pending', 'Rejected', 'Future Status'].forEach(function (s) {
+    Logger.log('=== FINAL STATUS: ' + s + ' ===\n' + buildFinalStatusMessage(headers, rowValues, ticketId, s) + '\n');
+  });
+}
+
+function testTicketIdGeneration() {
+  var ss    = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(DATA_SHEET_NAMES[0]);
+  if (!sheet) { Logger.log('❌ Sheet not found'); return; }
+  Logger.log('✅ Generated Ticket ID: ' + generateTicketId(sheet, null));
+}
+
+/*
+ * runSetupCheck
+ * ---------------------------------------------------------------
+ * Run this ONCE, manually, right after pasting this script into a new
+ * Apps Script project / new Google account. It checks every external
+ * dependency this script relies on and reports PASS/FAIL for each,
+ * so a config problem shows up clearly here instead of as a silent
+ * failure (a missing message, a message going to the wrong sheet,
+ * etc.) days later in production.
+ *
+ * Results go to both Logger (View → Logs / Execution log) and the
+ * AUTOMATION LOG sheet.
+ * ---------------------------------------------------------------
+ */
+function runSetupCheck() {
+  var results = [];
+
+  function check(name, fn) {
+    try {
+      var detail = fn();
+      results.push('✅ PASS — ' + name + (detail ? ' (' + detail + ')' : ''));
+    } catch (err) {
+      results.push('❌ FAIL — ' + name + ': ' + err.message);
+    }
+  }
+
+  // 1. Bound spreadsheet + data tabs
+  check('Script is bound to a spreadsheet', function () {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    if (!ss) throw new Error('getActiveSpreadsheet() returned nothing — open this script from Extensions → Apps Script inside the ticket spreadsheet, not as a standalone project.');
+    return ss.getName();
+  });
+
+  check('Data tab exists (' + DATA_SHEET_NAMES.join(' or ') + ')', function () {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    for (var i = 0; i < DATA_SHEET_NAMES.length; i++) {
+      var sh = ss.getSheetByName(DATA_SHEET_NAMES[i]);
+      if (sh) return 'found "' + DATA_SHEET_NAMES[i] + '"';
+    }
+    throw new Error('none of the expected tab names were found — check DATA_SHEET_NAMES matches your actual tab name exactly.');
+  });
+
+  check('Data tab has a phone number column', function () {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sheet = null;
+    for (var i = 0; i < DATA_SHEET_NAMES.length; i++) {
+      sheet = ss.getSheetByName(DATA_SHEET_NAMES[i]);
+      if (sheet) break;
+    }
+    if (!sheet) throw new Error('data tab not found (see previous check)');
+    var headers = getHeaders(sheet);
+    var found = headers.some(function (h) { return normalizeHeader(h).indexOf('mobile') >= 0 || normalizeHeader(h).indexOf('phone') >= 0; });
+    if (!found) throw new Error('no column header containing "mobile" or "phone" was found');
+    return 'ok';
+  });
+
+  // 2. Queue spreadsheet access
+  check('QUEUE_SPREADSHEET_ID is reachable', function () {
+    var ss = SpreadsheetApp.openById(QUEUE_SPREADSHEET_ID);
+    return ss.getName();
+  });
+
+  // 3. Customer detail spreadsheet access
+  check('CUSTOMER_DETAIL_SPREADSHEET_ID is reachable', function () {
+    var ss = SpreadsheetApp.openById(CUSTOMER_DETAIL_SPREADSHEET_ID);
+    return ss.getName();
+  });
+
+  // 4. Customer detail web app reachable
+  check('CUSTOMER_DETAIL_WEB_APP_URL responds', function () {
+    var url = (CUSTOMER_DETAIL_WEB_APP_URL || '').toString().trim();
+    if (!url) throw new Error('CUSTOMER_DETAIL_WEB_APP_URL is empty');
+    var response = UrlFetchApp.fetch(url + '?action=getCustomerByPhone&phone=0000000000', {
+      method: 'get', muteHttpExceptions: true, followRedirects: true
+    });
+    var code = response.getResponseCode();
+    if (code < 200 || code >= 300) throw new Error('HTTP ' + code + ' — check the deployment is live and access is set to "Anyone"');
+    return 'HTTP ' + code;
+  });
+
+  // 5. Queue sheet auto-provision (also confirms write access)
+  check('Queue sheet can be created/read/written', function () {
+    var sheet = getQueueSheet();
+    return sheet.getName() + ' in ' + sheet.getParent().getName();
+  });
+
+  // 6. Triggers installed
+  check('onEdit / onFormSubmit / resetStaleQueuedMessages triggers installed', function () {
+    var triggers = ScriptApp.getProjectTriggers();
+    var have = {};
+    triggers.forEach(function (t) { have[t.getHandlerFunction()] = true; });
+    var missing = ['onEdit', 'onFormSubmit', 'resetStaleQueuedMessages'].filter(function (fn) { return !have[fn]; });
+    if (missing.length) throw new Error('missing: ' + missing.join(', ') + ' — run installAllTriggers()');
+    return triggers.length + ' trigger(s) found';
+  });
+
+  var summary = '\n=== AMPAXIS SETUP CHECK ===\n' + results.join('\n') + '\n============================\n';
+  Logger.log(summary);
+  try { logAutomationEvent('SETUP_CHECK', '', results.join(' | ')); } catch (_) {}
+  return summary;
+}
+
+function diagnoseSheetNames() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  Logger.log('=== ALL SHEET NAMES ===');
+  ss.getSheets().forEach(function(s, i) { Logger.log('Tab ' + (i+1) + ': "' + s.getName() + '"'); });
+}

@@ -1,0 +1,500 @@
+// ============================================================
+// AMPAXIS - CUSTOMER DETAIL SPREADSHEET (SHEET 1)
+// Apps Script - Complete Version v3
+// ============================================================
+
+// ============================================================
+// CONFIG
+// ============================================================
+
+const SHEET_NAME = "Responses";
+
+const CUSTOMER_DETAIL_SPREADSHEET_ID = '1MLNmN1wyMlfF1yzxNFwQYZFw3QKsFVm3PMgsEDf1PA8';
+
+const CUSTOMER_DETAIL_FIELDS = [
+  'AMC Type',
+  'BHK Connection',
+  'Premises Details',
+  'Building Square Feet',
+  'Floor Number',
+  'Ownership',
+  'Contact Person Name',
+  'Contact Person Number',
+  'Address',
+  'Area',
+  'City',
+  'State',
+  'Location'
+];
+
+const PARENT_FOLDER_ID = "1mdbNlPr1RKZMhyoxfCdTCBHarP0tp788";
+
+const MAX_FILE_SIZE_MB = 15;
+const MAX_TOTAL_FILES = 20;
+const MAX_BASE64_LENGTH = MAX_FILE_SIZE_MB * 1024 * 1024 * 1.37;
+const RATE_LIMIT_SECONDS = 10;
+
+// ============================================================
+// HELPERS
+// ============================================================
+
+function sanitizeText(value) {
+  if (value === null || value === undefined) return "";
+  return String(value).replace(/[<>]/g, "").trim();
+}
+
+function jsonResponse(obj) {
+  return ContentService
+    .createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function getHeaders(sheet) {
+  var lastCol = sheet.getLastColumn();
+  if (!lastCol || lastCol < 1) return [];
+  return sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(function(h) {
+    return String(h || '').trim();
+  });
+}
+
+function normalizeHeader(value) {
+  return String(value || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function normalizePhone(value) {
+  if (!value) return "";
+  var cleaned = String(value).replace(/[^0-9+]/g, "");
+  if (!cleaned) return "";
+  if (cleaned.startsWith("+")) cleaned = cleaned.slice(1);
+  if (cleaned.length === 11 && cleaned.startsWith("0")) cleaned = cleaned.slice(1);
+  if (cleaned.length === 10) cleaned = "91" + cleaned;
+  if (cleaned.length > 10) cleaned = cleaned.replace(/^0+/, "");
+  return cleaned;
+}
+
+function checkRateLimit(key) {
+  var cache = CacheService.getScriptCache();
+  if (cache.get(key)) {
+    throw new Error("Too many requests. Please wait a few seconds.");
+  }
+  cache.put(key, "1", RATE_LIMIT_SECONDS);
+}
+
+// ============================================================
+// CORE: FETCH CUSTOMER BY PHONE
+// ✅ UPDATED: Detects ALL phone-like columns (handles sheets with
+//    multiple phone columns, e.g. col 12 and col 26), collects every
+//    matching row across those columns, and picks the most complete
+//    (highest non-empty cell count) row. Also merges duplicate-named
+//    headers by preferring the first non-empty value found.
+// ============================================================
+
+function fetchCustomerDetailsByPhone(phone) {
+  if (!phone) return null;
+  var normalizedPhone = normalizePhone(phone);
+  if (!normalizedPhone) return null;
+
+  try {
+    var ss = SpreadsheetApp.openById(CUSTOMER_DETAIL_SPREADSHEET_ID);
+    var sheets = ss.getSheets();
+
+    for (var s = 0; s < sheets.length; s++) {
+      var sheet = sheets[s];
+      var headers = getHeaders(sheet);
+      if (!headers || headers.length === 0) continue;
+
+      // Find ALL phone columns (col 12 and col 26 in your sheet)
+      var phoneColIndexes = [];
+
+      for (var h = 0; h < headers.length; h++) {
+        var cleanHeader = normalizeHeader(headers[h]);
+        if (
+          cleanHeader === 'contactpersonnumber' ||
+          cleanHeader === 'registermobilenumber' ||
+          cleanHeader === 'registeredmobilenumber' ||
+          cleanHeader === 'mobilenumber' ||
+          cleanHeader === 'phonenumber' ||
+          cleanHeader === 'mobile' ||
+          cleanHeader === 'phone'
+        ) {
+          phoneColIndexes.push(h);
+        }
+      }
+
+      if (phoneColIndexes.length === 0) {
+        // Fallback: contains "number" + "mobile/phone"
+        for (var h = 0; h < headers.length; h++) {
+          var cleanHeader = normalizeHeader(headers[h]);
+          if (cleanHeader.indexOf('number') !== -1 &&
+             (cleanHeader.indexOf('mobile') !== -1 || cleanHeader.indexOf('phone') !== -1)) {
+            phoneColIndexes.push(h);
+          }
+        }
+      }
+
+      if (phoneColIndexes.length === 0) continue;
+
+      var lastRow = sheet.getLastRow();
+      if (lastRow <= 1) continue;
+
+      var rows = sheet.getRange(2, 1, lastRow - 1, headers.length).getValues();
+
+      // ✅ Collect ALL matching rows — then pick the most complete one
+      var matchedRows = [];
+
+      for (var r = 0; r < rows.length; r++) {
+        for (var p = 0; p < phoneColIndexes.length; p++) {
+          var rawPhone = rows[r][phoneColIndexes[p]];
+          if (!rawPhone) continue;
+          var candidate = normalizePhone(rawPhone);
+          if (candidate && candidate === normalizedPhone) {
+            matchedRows.push(rows[r]);
+            break;
+          }
+        }
+      }
+
+      if (matchedRows.length === 0) continue;
+
+      Logger.log('[CustomerLookup] Found ' + matchedRows.length + ' matching row(s) for phone: ' + normalizedPhone);
+
+      // ✅ Score each row by how many non-empty cells it has
+      // Pick the row with the HIGHEST score (most filled data)
+      var bestRow = null;
+      var bestScore = -1;
+
+      for (var m = 0; m < matchedRows.length; m++) {
+        var score = 0;
+        for (var c = 0; c < matchedRows[m].length; c++) {
+          var val = matchedRows[m][c];
+          if (val !== '' && val !== null && val !== undefined) score++;
+        }
+        Logger.log('[CustomerLookup] Row ' + m + ' score: ' + score);
+        if (score > bestScore) {
+          bestScore = score;
+          bestRow = matchedRows[m];
+        }
+      }
+
+      // Build smart merged result from best row
+      var headerMap = {};
+      for (var h = 0; h < headers.length; h++) {
+        if (!headers[h]) continue;
+        var key = normalizeHeader(headers[h]);
+        if (!headerMap[key]) headerMap[key] = [];
+        headerMap[key].push(h);
+      }
+
+      var result = {};
+      for (var h = 0; h < headers.length; h++) {
+        var headerName = headers[h];
+        if (!headerName || result.hasOwnProperty(headerName)) continue;
+        var key = normalizeHeader(headerName);
+        var indexes = headerMap[key] || [];
+        var chosenValue = '';
+        for (var idx = 0; idx < indexes.length; idx++) {
+          var val = bestRow[indexes[idx]];
+          if (val !== '' && val !== null && val !== undefined) {
+            chosenValue = val;
+            break;
+          }
+        }
+        result[headerName] = chosenValue;
+      }
+
+      Logger.log('[CustomerLookup] ✅ Best row selected with score ' + bestScore +
+        ' → Name: ' + (result['Contact Person Name'] || 'Unknown') +
+        ' | AMC Type: ' + (result['AMC Type'] || ''));
+      return result;
+    }
+
+    Logger.log('[CustomerLookup] ❌ No customer found for phone: ' + normalizedPhone);
+    return null;
+
+  } catch (err) {
+    Logger.log('[CustomerLookup] ERROR: ' + err.message);
+    return null;
+  }
+}
+
+// ============================================================
+// SYNC CUSTOMER DETAILS → TICKET SHEET (Sheet 2)
+// ============================================================
+
+function syncCustomerDetailsToTicketRow(phone, ticketSpreadsheetId, ticketSheetName, ticketRow) {
+  var normalizedPhone = normalizePhone(phone);
+
+  if (!normalizedPhone) {
+    throw new Error('Missing or invalid phone number.');
+  }
+
+  var resolvedSheetName = (ticketSheetName || 'Ticket Raising page').toString().trim();
+  var rowNumber = Number(ticketRow);
+
+  if (!rowNumber || rowNumber <= 1) {
+    throw new Error('Missing or invalid ticket row number.');
+  }
+
+  var customer = fetchCustomerDetailsByPhone(normalizedPhone);
+  if (!customer) {
+    return { success: false, error: 'Customer not found for phone: ' + phone };
+  }
+
+  var ticketSpreadsheetIdToUse = (ticketSpreadsheetId || '').toString().trim();
+  if (!ticketSpreadsheetIdToUse) {
+    throw new Error('Missing ticket spreadsheet ID.');
+  }
+
+  var ticketSs = SpreadsheetApp.openById(ticketSpreadsheetIdToUse);
+  var ticketSheet = ticketSs.getSheetByName(resolvedSheetName);
+  if (!ticketSheet) {
+    throw new Error('Ticket sheet not found: ' + resolvedSheetName);
+  }
+
+  var ticketHeaders = getHeaders(ticketSheet);
+  if (!ticketHeaders || ticketHeaders.length === 0) {
+    throw new Error('Ticket sheet has no headers.');
+  }
+
+  var columns = [];
+  var updates = [];
+
+  for (var i = 0; i < ticketHeaders.length; i++) {
+    var normalized = normalizeHeader(ticketHeaders[i]);
+    for (var j = 0; j < CUSTOMER_DETAIL_FIELDS.length; j++) {
+      if (normalized === normalizeHeader(CUSTOMER_DETAIL_FIELDS[j])) {
+        columns.push(i + 1);
+        updates.push(customer[CUSTOMER_DETAIL_FIELDS[j]] || '');
+        break;
+      }
+    }
+  }
+
+  if (columns.length === 0) {
+    return { success: false, error: 'No matching columns found in ticket sheet.' };
+  }
+
+  for (var k = 0; k < columns.length; k++) {
+    ticketSheet.getRange(rowNumber, columns[k]).setValue(updates[k]);
+  }
+
+  return {
+    success: true,
+    updatedFields: columns.length,
+    row: rowNumber,
+    sheet: resolvedSheetName,
+    spreadsheetId: ticketSpreadsheetIdToUse,
+    customer: customer
+  };
+}
+
+// ============================================================
+// TEST FUNCTIONS — Run these in Apps Script Editor to verify
+// ============================================================
+
+function testPhoneLookup() {
+  // ✅ Replace with a real phone number from your Responses tab
+  var phone = '9012345678';
+  var result = fetchCustomerDetailsByPhone(phone);
+  Logger.log('=== TEST RESULT ===');
+  Logger.log(JSON.stringify(result, null, 2));
+  if (result) {
+    Logger.log('✅ SUCCESS — Customer found: ' + result['Contact Person Name']);
+  } else {
+    Logger.log('❌ FAILED — No customer found. Check phone number or column headers.');
+  }
+}
+
+function testSyncToTicketSheet() {
+  // ✅ Replace with real values
+  var phone = '9012345678';
+  var ticketSpreadsheetId = '1WgrADcT08No5MnLra1reZ9qhICVzHpBswAk-Hv5k4o0'; // Sheet 2 ID
+  var ticketSheetName = 'Ticket Raising page';
+  var ticketRow = 2;
+  var result = syncCustomerDetailsToTicketRow(phone, ticketSpreadsheetId, ticketSheetName, ticketRow);
+  Logger.log('=== SYNC RESULT ===');
+  Logger.log(JSON.stringify(result, null, 2));
+}
+
+// ============================================================
+// WEB APP ROUTES
+// ============================================================
+
+function doGet(e) {
+  var action = e && e.parameter && e.parameter.action ? e.parameter.action : "";
+
+  // ─── Route 1: Sheet 2 calls this to fetch customer by phone ───
+  if (action === "getCustomerByPhone") {
+    var phone = (e.parameter.phone || "").toString().trim();
+    if (!phone) {
+      return jsonResponse({ success: false, error: "Missing phone parameter." });
+    }
+    try {
+      var customer = fetchCustomerDetailsByPhone(phone);
+      if (customer) {
+        return jsonResponse({ success: true, data: customer });
+      } else {
+        return jsonResponse({ success: false, data: null, error: "Customer not found for phone: " + phone });
+      }
+    } catch (err) {
+      return jsonResponse({ success: false, error: err.message });
+    }
+  }
+
+  // ─── Route 2: Sync customer details into ticket row ───
+  if (action === "syncCustomerToTicket") {
+    try {
+      var phone = (e.parameter.phone || "").toString().trim();
+      var ticketSpreadsheetId = (e.parameter.ticketSpreadsheetId || "").toString().trim();
+      var ticketSheetName = (e.parameter.ticketSheetName || "Ticket Raising page").toString().trim();
+      var ticketRow = e.parameter.ticketRow;
+      var result = syncCustomerDetailsToTicketRow(phone, ticketSpreadsheetId, ticketSheetName, ticketRow);
+      return jsonResponse(result);
+    } catch (err) {
+      return jsonResponse({ success: false, error: err.message });
+    }
+  }
+
+  // ─── Health check ───
+  return HtmlService.createHtmlOutput(
+    "<h2>✅ Ampaxis Customer Detail API is Running</h2>" +
+    "<p>Available actions: <code>getCustomerByPhone</code>, <code>syncCustomerToTicket</code></p>"
+  );
+}
+
+// ============================================================
+// doPost
+// ============================================================
+
+function doPost(e) {
+  try {
+    var data = JSON.parse(e.postData.contents);
+
+    // ─── Get customer by phone ───
+    if (data.action === "getCustomerByPhone") {
+      var phone = (data.phone || '').toString().trim();
+      if (!phone) {
+        return jsonResponse({ success: false, error: 'Missing phone parameter.' });
+      }
+      var customer = fetchCustomerDetailsByPhone(phone);
+      return jsonResponse({ success: true, data: customer });
+    }
+
+    // ─── Sync customer to ticket row ───
+    if (data.action === "syncCustomerToTicket") {
+      var phone = (data.phone || '').toString().trim();
+      var ticketSpreadsheetId = (data.ticketSpreadsheetId || '').toString().trim();
+      var ticketSheetName = (data.ticketSheetName || 'Ticket Raising page').toString().trim();
+      var ticketRow = data.ticketRow;
+      var result = syncCustomerDetailsToTicketRow(phone, ticketSpreadsheetId, ticketSheetName, ticketRow);
+      return jsonResponse(result);
+    }
+
+    // ─── File Upload ───
+    if (data.action === "uploadFiles") {
+      if (!data.userName) throw new Error("Missing user name.");
+      var userKey = "upload_unknown";
+      checkRateLimit(userKey);
+      var files = data.files || [];
+      if (files.length > MAX_TOTAL_FILES) throw new Error("Too many uploaded files.");
+      var parentFolder = DriveApp.getFolderById(PARENT_FOLDER_ID);
+      var submissionFolder;
+      if (data.folderId) {
+        submissionFolder = DriveApp.getFolderById(data.folderId);
+      } else {
+        var folderName = sanitizeText(data.userName) + "_" +
+          Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd_HH-mm-ss") +
+          "_" + Utilities.getUuid().substring(0, 8);
+        submissionFolder = parentFolder.createFolder(folderName);
+      }
+      var uploadedLinks = [];
+      files.forEach(function(file) {
+        if (!file.data || !file.name) return;
+        if (file.data.length > MAX_BASE64_LENGTH) throw new Error(file.name + " exceeds maximum size.");
+        var blob = Utilities.newBlob(
+          Utilities.base64Decode(file.data),
+          file.mimeType,
+          sanitizeText(file.name)
+        );
+        var uploaded = submissionFolder.createFile(blob);
+        uploaded.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+        uploadedLinks.push(uploaded.getUrl());
+      });
+      return jsonResponse({ success: true, links: uploadedLinks, folderId: submissionFolder.getId() });
+    }
+
+    // ─── Add AMC Form Submission ───
+    if (data.formType === "addAMC") {
+      if (!data.serviceType) throw new Error("AMC Type is required.");
+      var submitKey = "submit_" + (data.submissionFolderId || Utilities.getUuid());
+      checkRateLimit(submitKey);
+      var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+      var service = data.service || {};
+      var ebBillLinks = (data.proofFiles || []).join("\n");
+
+      if (data.serviceType === "domestic") {
+        sheet.appendRow([
+          new Date(), sanitizeText(data.serviceType),
+          sanitizeText(service.BHKConnection), sanitizeText(service.premisesDetails),
+          sanitizeText(service.buildingAge), sanitizeText(service.buildingSquareFeet),
+          sanitizeText(service.floorNumber), sanitizeText(service.ebServiceId),
+          sanitizeText(service.meter), sanitizeText(service.ownership),
+          sanitizeText(service.contactPersonName), sanitizeText(service.contactPersonNumber),
+          sanitizeText(service.address), sanitizeText(service.area),
+          sanitizeText(service.city), sanitizeText(service.state),
+          ebBillLinks, sanitizeText(service.location),
+          "", "", "", "", "", "", "", "", "", "", "", "", ""
+        ]);
+      } else if (data.serviceType === "commercial") {
+        sheet.appendRow([
+          new Date(), sanitizeText(data.serviceType),
+          "", "", "", "", "", "", "", "",
+          "", "", "", "", "", "", "", "",
+          sanitizeText(service.kVAConnectionCapacity), sanitizeText(service.premisesDetails),
+          sanitizeText(service.buildingAge), sanitizeText(service.buildingSquareFeet),
+          sanitizeText(service.floorNumber), sanitizeText(service.ebServiceId),
+          sanitizeText(service.contactPersonName), sanitizeText(service.contactPersonNumber),
+          sanitizeText(service.address), sanitizeText(service.area),
+          sanitizeText(service.city), sanitizeText(service.state),
+          ebBillLinks, sanitizeText(service.location)
+        ]);
+      }
+
+      return jsonResponse({ success: true });
+    }
+
+    throw new Error("Invalid request.");
+
+  } catch (err) {
+    Logger.log('[doPost] ERROR: ' + err.message);
+    return jsonResponse({ success: false, error: err.message });
+  }
+}
+function diagnoseCustomerRow() {
+  var ss = SpreadsheetApp.openById(CUSTOMER_DETAIL_SPREADSHEET_ID);
+  var sheet = ss.getSheetByName("Responses");
+  var headers = getHeaders(sheet);
+  var lastRow = sheet.getLastRow();
+  var rows = sheet.getRange(2, 1, lastRow - 1, headers.length).getValues();
+
+  // Print ALL headers with their column number
+  Logger.log('=== ALL HEADERS IN RESPONSES TAB ===');
+  for (var h = 0; h < headers.length; h++) {
+    Logger.log('Col ' + (h + 1) + ' → "' + headers[h] + '"');
+  }
+
+  // Find the row with phone 9012345678 and print ALL its values
+  Logger.log('=== ROW DATA FOR PHONE 9012345678 ===');
+  for (var r = 0; r < rows.length; r++) {
+    for (var c = 0; c < headers.length; c++) {
+      var rawPhone = String(rows[r][c] || '').replace(/[^0-9]/g, '');
+      if (rawPhone.endsWith('9012345678')) {
+        Logger.log('--- Found at row ' + (r + 2) + ' ---');
+        for (var i = 0; i < headers.length; i++) {
+          Logger.log('"' + headers[i] + '" → "' + rows[r][i] + '"');
+        }
+        break;
+      }
+    }
+  }
+}
